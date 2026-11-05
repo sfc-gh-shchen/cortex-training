@@ -660,7 +660,7 @@ def config_details(root: Path, pairing: dict, ledger: dict, report: dict,
         ("Cleanup verification", cleanup_label(report, ledger)),
         ("Training config", pairing.get("training_config")),
         ("Sampling config", pairing.get("inference_config")),
-        ("Requested image tag", image_tag),
+        ("Requested image tag", image_tag or "Deployment default"),
         ("Previous result", previous.title() if previous else "Not recorded"),
         ("Change", change or "Not yet comparable"),
     ))
@@ -1048,7 +1048,7 @@ def render(root: Path) -> str:
         f'<section class="summary" aria-label="Suite counts">{summaries}</section>'
         f'<div class="view-controls"><span id="visible-count" aria-live="polite">{len(valid)} / {len(valid)} configs</span></div>'
         f'</div>{notice_html}'
-        f'<p class="image-tag">Requested matrix image tag <strong>{esc(manifest.get("image_tag", "Not recorded"))}</strong></p>'
+        f'<p class="image-tag">Requested matrix image tag <strong>{esc(manifest.get("image_tag") or "Deployment default")}</strong></p>'
         f'{comparison_html}'
         '<section class="metrics" aria-label="Test GPU metrics">'
         f'<span>Test GPU limit<strong>{esc(limit if limit is not None else "Not recorded")}</strong></span>'

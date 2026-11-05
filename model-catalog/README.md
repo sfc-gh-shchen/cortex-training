@@ -212,9 +212,10 @@ reservations, and observed peaks are recorded separately in the ledger.
 Do not submit unrelated jobs to the same account
 during a sweep. Only one sweep command can run for an operating-system user at
 a time, including archived replays.
-Configs are not tuned or retried. The base image tag is pinned on both original
-and restored requests, and its resolved Hopper variant is verified before
-lifecycle operations.
+Configs are not tuned or retried. When `--image-tag` is given, the base image tag
+is pinned on both original and restored requests, and its resolved Hopper variant
+is verified before lifecycle operations. Without it, jobs run on the deployment
+default and `image-audit.json` records the image each job reported.
 
 The output includes exact composed requests, input/source snapshots and SHA256
 fingerprints, Python/package versions, a GPU reservation ledger, per-config

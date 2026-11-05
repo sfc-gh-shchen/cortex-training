@@ -35,13 +35,14 @@ def resolve_file_connection(path):
 
 def pin_request(request, image_tag):
     pinned = deepcopy(request)
-    pinned.setdefault("debug", {}).setdefault("job", {})["image_tag"] = image_tag
+    if image_tag:
+        pinned.setdefault("debug", {}).setdefault("job", {})["image_tag"] = image_tag
     return pinned
 
 
 def resolved_image_tag(image_tag):
     # The pairing manifest currently contains only Hopper hardware.
-    return image_tag + "-h"
+    return image_tag + "-h" if image_tag else None
 
 
 class ImageVerifiedClient:
@@ -76,8 +77,10 @@ class ImageVerifiedClient:
         return ready
 
     def _verify(self, job_id, job, *, require_match=True):
+        # Without --image-tag the jobs run on the deployment default; record what they ran on.
+        expected = resolved_image_tag(self.image_tag)
         actual = job.get("image_tag")
-        verified = actual == resolved_image_tag(self.image_tag)
+        verified = None if expected is None else actual == expected
         self.audit["jobs"].append({
             "job_id": job_id, "image_tag": actual, "verified": verified,
         })
@@ -85,10 +88,9 @@ class ImageVerifiedClient:
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps(self.audit, indent=2) + "\n")
         temporary.replace(path)
-        if require_match and not verified:
+        if require_match and verified is False:
             raise RuntimeError(
-                f"Job image mismatch: expected {resolved_image_tag(self.image_tag)!r}, "
-                f"got {actual!r}"
+                f"Job image mismatch: expected {expected!r}, got {actual!r}"
             )
 
 
@@ -99,7 +101,7 @@ def main(argv=None):
     parser.add_argument("--connection-config", type=Path, required=True)
     parser.add_argument("--connection-sha256", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--image-tag", required=True)
+    parser.add_argument("--image-tag", default=None)
     args = parser.parse_args(argv)
     payload = args.request.read_bytes()
     if hashlib.sha256(payload).hexdigest() != args.request_sha256:

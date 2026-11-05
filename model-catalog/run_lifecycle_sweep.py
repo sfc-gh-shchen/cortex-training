@@ -501,15 +501,15 @@ def finish(state, pair, returncode, report, cleanup, statuses, error):
 
 
 def command(pair, root, connection, image_tag, request_sha256, connection_sha256):
-    return [
+    args = [
         sys.executable, str(root / "inputs" / "model-catalog" / "run_lifecycle_config.py"),
         "--request", str(root / "inputs" / "requests" / f'{pair["id"]}.json'),
         "--request-sha256", request_sha256,
         "--connection-config", str(connection),
         "--connection-sha256", connection_sha256,
         "--output-dir", str(root / "configs" / pair["id"]),
-        "--image-tag", image_tag,
     ]
+    return args + ["--image-tag", image_tag] if image_tag else args
 
 
 def collect_result(child, root, state, client):
@@ -831,7 +831,8 @@ def run_sweep(args, manifest, requests):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--image-tag", required=True)
+    parser.add_argument("--image-tag",
+                        help="Pin every job to this base image tag (default: the deployment's image)")
     parser.add_argument("--max-parallel-gpus", type=int, required=True)
     parser.add_argument("--budget-scope", choices=BUDGET_SCOPES, default="account")
     selection = parser.add_mutually_exclusive_group()
@@ -844,7 +845,7 @@ def main(argv=None):
     parser.add_argument("--previous-run", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
-    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", args.image_tag):
+    if args.image_tag is not None and not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", args.image_tag):
         parser.error("image tag must be a nonempty base tag")
     args.connection_config = args.connection_config.resolve()
     if not args.connection_config.is_file():
