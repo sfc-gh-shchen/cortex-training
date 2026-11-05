@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import html
 import json
 from pathlib import Path
@@ -29,6 +29,7 @@ PHASES = (
     ("7", "Restore checkpoint", "Restore"), ("8", "Train 3", "T3"),
     ("9", "Stop restored job", "Stop2"), ("cleanup", "Cleanup", "Clean"),
 )
+# Card labels for the Nov 5 catalog. Unknown models keep the pairing id.
 SHORT_MODEL_NAMES = {
     "deepseek-v4.1-flash-1017": "DeepSeek V4.1 Flash",
     "gemma-3-4b-it": "Gemma 3 4B",
@@ -239,8 +240,6 @@ def phase_tiles(report: dict) -> tuple[str, str]:
         '<span class="phase-footer">'
         f'<span class="tile-focus" title="{esc(focus_text)}">{esc(focus_text)}</span>'
         f'<span class="phase-counts" title="{esc(counts)}">{esc(counts)}</span>'
-        f'<span class="phase-counts-compact" title="{esc(counts)}" aria-label="{esc(counts)}">'
-        f'{total["passed"]}/{expected} &#10003; &middot; {total["failed"]} &#10005;</span>'
         '</span></span>'
     )
     return section, focus_text
@@ -307,7 +306,6 @@ def previous_results(root: Path, manifest: dict) -> tuple[dict[str, str], list[s
     for name in ("manifest.json", "ledger.json"):
         path = baseline / name
         if not local_file(baseline, path):
-            notices.append(f"Previous run {name} is unavailable or unsafe.")
             documents[name] = {}
             continue
         documents[name], error = read_object(path)
@@ -342,15 +340,6 @@ def result_change(status: str, previous: str | None) -> str:
     return "Fixed" if status == "passed" else "Regressed"
 
 
-def expected_resolved_image_tag(manifest: dict) -> object:
-    if manifest.get("resolved_image_tag"):
-        return manifest["resolved_image_tag"]
-    requested = manifest.get("image_tag")
-    if isinstance(requested, str) and manifest.get("hardware") == "H200":
-        return requested if requested.endswith("-h") else requested + "-h"
-    return None
-
-
 def badge(status: object) -> str:
     status = str(status)
     style = status if status in STATUSES else "incomplete"
@@ -369,7 +358,7 @@ def config_tile(
     model = str(pairing.get("model", "Unknown"))
     context = str(pairing.get("context", "Unknown"))
     mode = str(pairing.get("mode", "Unknown"))
-    short = SHORT_MODEL_NAMES.get(model, model if len(model) <= 24 else model[:21] + "...")
+    short = SHORT_MODEL_NAMES.get(model, model)
     compact_context = "std" if context == "standard" else context
     compact_mode = "LoRA" if mode == "lora" else mode
     label = f"{model} | {context} / {mode} | {status.title()}"
@@ -385,7 +374,8 @@ def config_tile(
     tile_class = "config-tile has-runtime" if runtime is not None else "config-tile"
     return (
         f'<a class="{tile_class}" href="#{anchor}" data-config-link data-status="{status}" '
-        f'data-model="{esc(model)}" data-detail="{anchor}" data-search="{esc(search_text.lower())}" '
+        f'data-model="{esc(model)}" data-detail="{anchor}" data-id="{esc(str(pairing.get("id", "")))}" '
+        f'data-search="{esc(search_text.lower())}" '
         f'title="{esc(label)}" aria-label="{esc(label)}">'
         f'<span class="tile-model">{esc(short)}</span>'
         f'<span class="tile-config">{esc(compact_context)} / {esc(compact_mode)}</span>'
@@ -497,6 +487,74 @@ def field(label: str, value: object) -> str:
     return f"<dt>{esc(label)}</dt><dd>{esc(value if value is not None else 'Not recorded')}</dd>"
 
 
+def pairing_anchor(identifier: str, index: int, used: set[str]) -> str:
+    slug = identifier if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]*", identifier) else ""
+    if not slug:
+        slug = f"config-{index + 1}"
+    if slug in used:
+        slug = f"{slug}-{index + 1}"
+    used.add(slug)
+    return slug
+
+
+def one_line(value: object, limit: int = 400) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, (dict, list)):
+        text = json.dumps(redact(value), ensure_ascii=True)
+    else:
+        text = redact_text(str(value))
+    text = re.sub(r"\s+", " ", text).strip() or "-"
+    if len(text) > limit:
+        return text[: limit - 3] + "..."
+    return text
+
+
+def first_failure(report: dict, status: str, reason: str) -> tuple[str, str]:
+    failed = [check for check in phase_checks(report) if check.get("status") == "failed"]
+    if failed:
+        check = failed[0]
+        name = str(check.get("name") or "-")
+        if len(failed) > 1:
+            name = f"{name} (+{len(failed) - 1} more)"
+        return name, one_line(check.get("error") or report.get("error") or reason)
+    if status == "passed":
+        return "-", "-"
+    return "-", one_line(report.get("error") or reason)
+
+
+def debug_packet(
+    identifier: str, status: str, report: dict, reason: str, directory: Path | None, root: Path,
+) -> str:
+    failed_check, error = first_failure(report, status, reason)
+    paths = []
+    if directory is not None:
+        for name in ("report.json", "console.log"):
+            path = directory / name
+            if local_file(root, path):
+                paths.append(path.relative_to(root).as_posix())
+    packet = "\n".join((
+        f"id: {identifier or '-'}",
+        f"status: {status}",
+        f"failed_check: {failed_check}",
+        f"error: {error}",
+        f"artifacts: {' '.join(paths) or '-'}",
+        f"rerun: PAIRINGS={identifier}" if identifier else "rerun: -",
+    ))
+    return f'<pre class="debug-packet">{esc(packet)}</pre>'
+
+
+def failure_item(pairing: dict, status: str, anchor: str, report: dict, reason: str) -> str:
+    identifier = str(pairing.get("id", "") or anchor)
+    failed_check, error = first_failure(report, status, reason)
+    return (
+        f'<a class="failure-item" href="#{anchor}" data-config-link data-detail="{anchor}">'
+        f'<span class="failure-id">{esc(identifier)}</span>'
+        f'<span class="failure-check">{esc(failed_check)}</span>'
+        f'<span class="failure-error">{esc(one_line(error, 180))}</span></a>'
+    )
+
+
 def cleanup_label(report: dict, ledger: dict) -> str:
     if ledger.get("cleanup_verified") is True:
         return "Verified"
@@ -514,8 +572,7 @@ def cleanup_label(report: dict, ledger: dict) -> str:
 def config_details(root: Path, pairing: dict, ledger: dict, report: dict,
                    status: str, reason: str, report_error: str, anchor: str,
                    directory: Path | None, now: datetime, image_tag: object = None,
-                   previous: str | None = None, change: str = "",
-                   resolved_image_tag: object = None) -> str:
+                   previous: str | None = None, change: str = "") -> str:
     checks = phase_checks(report)
     phases = []
     for check in checks:
@@ -587,11 +644,6 @@ def config_details(root: Path, pairing: dict, ledger: dict, report: dict,
             link = artifact_link(root, path)
             if link:
                 links.append(link)
-    worker = ledger.get("worker")
-    if isinstance(worker, str) and re.fullmatch(r"[A-Za-z0-9_.-]+", worker):
-        link = artifact_link(root, root / f"notes-{worker}.md", "Worker notes")
-        if link:
-            links.append(link)
     diagnostics = report.get("diagnostics")
     if isinstance(diagnostics, list):
         for diagnostic in diagnostics:
@@ -601,7 +653,7 @@ def config_details(root: Path, pairing: dict, ledger: dict, report: dict,
     times = "".join(field(label, value) for label, value in (
         ("Suite status", report.get("status", "No report")),
         ("Ledger status", ledger.get("status", "No entry")),
-        ("Worker", worker), ("Return code", ledger.get("returncode")),
+        ("Worker", ledger.get("worker")), ("Return code", ledger.get("returncode")),
         ("Started", start),
         ("Finished", finish),
         ("Elapsed", config_runtime(report, ledger, now)),
@@ -609,7 +661,6 @@ def config_details(root: Path, pairing: dict, ledger: dict, report: dict,
         ("Training config", pairing.get("training_config")),
         ("Sampling config", pairing.get("inference_config")),
         ("Requested image tag", image_tag),
-        ("Expected resolved image tag", resolved_image_tag),
         ("Previous result", previous.title() if previous else "Not recorded"),
         ("Change", change or "Not yet comparable"),
     ))
@@ -630,9 +681,12 @@ def config_details(root: Path, pairing: dict, ledger: dict, report: dict,
         "checkpoints": report.get("checkpoints"),
     })
     return (
-        f'<details class="config-detail" id="{anchor}"><summary>'
-        f"{badge(status)} <span>{esc(pairing.get('id', 'Missing ID'))}</span></summary>"
-        '<div class="detail-body"><p><a href="#results">Results</a></p>'
+        f'<article class="config-detail" id="{anchor}">'
+        f'<div class="detail-heading">{badge(status)}'
+        f"<span>{esc(pairing.get('id', 'Missing ID'))}</span>"
+        '<a class="muted" href="#results">Back to cards</a></div>'
+        + debug_packet(str(pairing.get("id", "")), status, report, reason, directory, root)
+        + '<div class="detail-body">'
         + "".join(errors) + f"<dl>{times}</dl>"
         '<h3>Phases</h3><div class="table-scroll"><table class="phases">'
         '<thead><tr><th>Check</th><th>Status</th><th>Duration</th><th>Error / result</th></tr></thead>'
@@ -644,7 +698,7 @@ def config_details(root: Path, pairing: dict, ledger: dict, report: dict,
             '<ul class="artifacts">' + "".join(f"<li>{link}</li>" for link in links) + "</ul>"
             if links else '<p class="muted">None recorded</p>'
         ) + ("<h3>Error excerpts</h3>" + "".join(excerpts) if excerpts else "")
-        + "</div></details>"
+        + "</div></article>"
     )
 
 
@@ -663,14 +717,13 @@ a { color: #075b92; text-underline-offset: 2px; overflow-wrap: anywhere; }
 a:hover { color: #003b61; } :focus-visible { outline: 3px solid #087da5; outline-offset: 3px; }
 .summary, .metrics { display: flex; flex-wrap: wrap; gap: 12px 22px; padding: 12px 0; border-bottom: 1px solid #ccd3d5; }
 .summary strong { font-size: 19px; margin-right: 5px; } .metrics strong { margin-left: 6px; }
-.image-tag, .resolved-image-tag { font-size: 16px; margin: 10px 0; overflow-wrap: anywhere; }
+.image-tag { font-size: 16px; margin: 10px 0; overflow-wrap: anywhere; }
 .comparison { padding: 10px 0; border-bottom: 1px solid #ccd3d5; overflow-wrap: anywhere; }
 .comparison-counts { display: flex; flex-wrap: wrap; gap: 6px 18px; }
 .fixed { color: #166534; } .regressed { color: #b91c1c; }
 .controls { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin: 16px 0; }
 label { display: grid; gap: 4px; font-weight: 600; }
-input, select, button { font: inherit; background: white; border: 1px solid #a5b2b7; border-radius: 4px; padding: 7px 9px; min-height: 35px; max-width: 100%; }
-button { cursor: pointer; } button[aria-pressed="true"] { background: #202628; color: white; }
+input, select { font: inherit; background: white; border: 1px solid #a5b2b7; border-radius: 4px; padding: 7px 9px; min-height: 35px; max-width: 100%; }
 .view-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin: 8px 0; }
 input { width: 310px; } select { min-width: 145px; } #visible-count { align-self: center; }
 .table-scroll { overflow-x: auto; border: 1px solid #cdd5d8; }
@@ -688,7 +741,9 @@ background: #e5eaed; color: #35474e; box-shadow: inset 0 0 0 1px #c2ccd0; font-s
 .config-tile[data-status="passed"] { background: #166534; box-shadow: inset 0 0 0 1px #166534; color: #fff; }
 .config-tile[data-status="failed"] { background: #b91c1c; box-shadow: inset 0 0 0 1px #b91c1c; color: #fff; }
 .config-tile[data-status="running"] { background: #075985; box-shadow: inset 0 0 0 1px #075985; color: #fff; }
+.config-tile[data-status="queued"] { background: #59636a; box-shadow: inset 0 0 0 1px #59636a; color: #fff; }
 .config-tile[data-status="incomplete"] { background: #855400; box-shadow: inset 0 0 0 1px #855400; color: #fff; }
+.config-tile.selected { box-shadow: inset 0 0 0 2px #fff, 0 0 0 2px #202628; }
 .tile-model { grid-column: 1; grid-row: 1; font-weight: 650; font-size: 11px; line-height: 12px; }
 .tile-model, .tile-config, .tile-runtime, .tile-focus, .phase-label { min-width: 0; min-height: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tile-config { grid-column: 1; grid-row: 2; }
@@ -710,49 +765,44 @@ min-width: 0; min-height: 0; border-radius: 3px; box-shadow: inset 0 0 0 1px #ff
 .phase-footer { display: grid; gap: 1px; min-width: 0; min-height: 0; }
 .tile-focus { font-size: 10px; line-height: 11px; }
 .phase-counts { font-size: 9px; line-height: 10px; overflow-wrap: anywhere; }
-.phase-counts-compact { display: none; }
 .status { display: inline-flex; align-items: center; gap: 4px; font-weight: 650; white-space: nowrap; }
 .status > span { display: inline-grid; place-items: center; width: 15px; height: 15px; }
 .passed { color: #166534; } .failed { color: #b91c1c; } .running { color: #075985; }
 .queued { color: #59636a; } .incomplete { color: #855400; }
-.config-detail { border-bottom: 1px solid #cdd5d8; }
-.config-detail > summary { padding: 12px 0; cursor: pointer; overflow-wrap: anywhere; }
-.config-detail > summary > span:last-child { margin-left: 8px; }
-.config-detail[open] > summary { border-bottom: 1px solid #dfe4e6; }
-.detail-body { padding: 0 0 20px; }
+.config-detail { display: none; margin-top: 18px; padding: 14px 16px 8px; border: 1px solid #cdd5d8; border-radius: 8px; background: #fff; scroll-margin-top: 12px; }
+.config-detail:target { display: block; }
+.config-detail > .detail-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 12px; margin: 0 0 10px; }
+.config-detail > .detail-heading .muted { margin-left: auto; }
+.detail-body { padding: 0 0 8px; }
 dl { display: grid; grid-template-columns: 160px minmax(0, 1fr); gap: 6px 16px; }
 dt { color: #606b70; } dd { margin: 0; overflow-wrap: anywhere; }
 pre { margin: 4px 0 12px; padding: 10px 12px; background: #edf0f1; border-left: 3px solid #aab8be; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; max-height: 420px; overflow: auto; }
+.debug-packet { margin: 0 0 12px; background: #202628; color: #e8eeef; border-left: 0; max-height: none; overflow: visible; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .phases { min-width: 730px; } .phases th { max-width: 350px; overflow-wrap: anywhere; }
 .phases td:last-child { max-width: 650px; overflow-wrap: anywhere; }
 .artifacts { margin: 0; padding-left: 20px; }
 .notice { border-left: 3px solid #b57c19; padding: 8px 12px; background: #fff5d8; }
 .failure-text { color: #a31a1a; } [hidden] { display: none !important; }
-body.capture-view main { height: 100dvh; display: flex; flex-direction: column; padding: 5px 8px; gap: 4px; min-height: 0; }
-body.capture-view main > :not(.report-top):not(.config-grid),
-body.capture-view header p { display: none !important; }
-body.capture-view .capture-hide, body.capture-view .config-detail, body.capture-view .details-heading { display: none !important; }
-body.capture-view header { flex: none; min-width: 0; }
-body.capture-view .report-top { display: flex; flex: none; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 4px 10px; min-width: 0; }
-body.capture-view header h1 { font-size: 18px; line-height: 20px; }
-body.capture-view .summary { flex: 0 1 auto; min-width: 0; max-width: 100%; padding: 2px 0; gap: 3px 12px; font-size: 10px; line-height: 16px; }
-body.capture-view .summary strong { font-size: 13px; }
-body.capture-view .view-controls { flex: none; margin: 0; font-size: 10px; line-height: 12px; }
-body.capture-view #capture-toggle { font-size: 10px; line-height: 12px; min-height: 22px; padding: 3px 6px; }
-body.capture-view .config-grid { flex: 1; min-height: 0; min-width: 0; grid-template-columns: repeat(5, minmax(0, 1fr)); grid-auto-rows: minmax(0, 1fr); gap: 4px; }
-body.capture-view .config-tile { min-height: 0; min-width: 0; padding: 4px 5px; font-size: 10px; line-height: 10px; gap: 0 3px; }
-body.capture-view .tile-model, body.capture-view .tile-config, body.capture-view .tile-runtime { font-size: 10px; line-height: 10px; }
-body.capture-view .tile-phases { gap: 0; }
-body.capture-view .phase-grid { grid-auto-rows: minmax(0, 1fr); gap: 1px; }
-body.capture-view .phase-badge { padding: 0 1px; overflow: hidden; }
-body.capture-view .phase-label { font-size: 7px; line-height: 7px; }
-body.capture-view .tile-focus, body.capture-view .phase-steps, body.capture-view .phase-counts { display: none; }
-body.capture-view .phase-counts-compact { display: block; font-size: 10px; line-height: 10px; white-space: nowrap; }
-body.capture-view :focus-visible { outline: none; box-shadow: inset 0 0 0 2px #fff, inset 0 0 0 4px #202628; }
+.failure-rail { background: #fff; border: 1px solid #cdd5d8; border-radius: 8px; padding: 10px; min-width: 0; }
+.failure-rail h2 { margin: 0 0 8px; font-size: 14px; }
+.failure-rail h2 span { font-weight: 400; color: #606b70; }
+.failure-list { display: grid; gap: 6px; }
+.failure-item { display: grid; gap: 2px; padding: 8px 9px; border-radius: 5px;
+background: #f8eaea; box-shadow: inset 3px 0 0 #b91c1c; color: #202628; text-decoration: none; }
+.failure-item:hover { color: #202628; filter: brightness(.97); }
+.failure-item.selected { box-shadow: inset 3px 0 0 #b91c1c, 0 0 0 2px #202628; }
+.failure-id { font-weight: 650; font-size: 12px; overflow-wrap: anywhere; }
+.failure-check { color: #b91c1c; font-weight: 650; font-size: 11px; }
+.failure-error { color: #35474e; font-size: 11px; line-height: 14px;
+display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.report-body { min-width: 0; }
+@media (min-width: 900px) {
+main.has-failures { display: grid; grid-template-columns: minmax(240px, 300px) minmax(0, 1fr); gap: 16px 20px; align-items: start; }
+main.has-failures .failure-rail { position: sticky; top: 12px; max-height: calc(100dvh - 24px); overflow: auto; }
+}
 @media (min-width: 900px) {
 main { padding: 12px 20px 40px; } header h1 { font-size: 21px; } header p { margin: 2px 0; }
-.image-tag, .resolved-image-tag { display: inline-block; font-size: 14px; margin: 4px 18px 4px 0; }
-.preflight { font-size: 12px; margin: 2px 0; }
+.image-tag { display: inline-block; font-size: 14px; margin: 4px 18px 4px 0; }
 .summary, .metrics { padding: 6px 0; } .summary strong { font-size: 18px; }
 .comparison { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px; padding: 6px 0; }
 .comparison p { margin: 0; } .controls { margin: 10px 0; gap: 10px; }
@@ -761,11 +811,6 @@ main { padding: 12px 20px 40px; } header h1 { font-size: 21px; } header p { marg
 input { width: 100%; } .controls > label:first-child { width: 100%; }
 .config-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 dl { grid-template-columns: 110px minmax(0, 1fr); gap: 6px 8px; }
-body.capture-view main { height: auto; min-height: 100dvh; }
-body.capture-view .config-grid { flex: none; grid-template-columns: repeat(2, minmax(0, 1fr)); grid-auto-rows: auto; }
-body.capture-view .config-tile { min-height: 116px; }
-body.capture-view .config-tile.has-runtime { min-height: 128px; }
-body.capture-view .phase-grid { grid-auto-rows: minmax(16px, 1fr); }
 }
 """
 
@@ -775,14 +820,12 @@ JS = """
   const status = document.getElementById('status-filter');
   const model = document.getElementById('model-filter');
   const tiles = [...document.querySelectorAll('.config-tile')];
-  const capture = document.getElementById('capture-toggle');
-  function setCapture(enabled) {
-    document.body.classList.toggle('capture-view', enabled);
-    capture.setAttribute('aria-pressed', String(enabled));
+  const failures = [...document.querySelectorAll('.failure-item')];
+  function markSelected() {
+    const id = location.hash.slice(1);
+    tiles.forEach(tile => tile.classList.toggle('selected', tile.dataset.detail === id));
+    failures.forEach(item => item.classList.toggle('selected', item.dataset.detail === id));
   }
-  capture.addEventListener('click', () => {
-    setCapture(!document.body.classList.contains('capture-view'));
-  });
   function filter() {
     let visible = 0;
     const query = search.value.trim().toLowerCase();
@@ -791,7 +834,6 @@ JS = """
         && (!status.value || tile.dataset.status === status.value)
         && (!model.value || tile.dataset.model === model.value);
       tile.hidden = !show;
-      document.getElementById(tile.dataset.detail).hidden = !show;
       if (show) visible++;
     });
     document.getElementById('visible-count').textContent = visible + ' / ' + tiles.length + ' configs';
@@ -800,23 +842,24 @@ JS = """
   [search, status, model].forEach(control => control.addEventListener('input', filter));
   function openHash() {
     const target = document.getElementById(location.hash.slice(1));
+    markSelected();
     if (!target || !target.classList.contains('config-detail')) return;
-    setCapture(false);
-    if (target.hidden) { search.value = ''; status.value = ''; model.value = ''; filter(); }
-    target.open = true;
     target.scrollIntoView({block: 'start'});
   }
-  document.querySelectorAll('a[data-config-link]').forEach(link => {
-    link.addEventListener('click', () => {
-      const target = document.getElementById(link.hash.slice(1));
-      if (target) { setCapture(false); target.open = true; }
-    });
-  });
   window.addEventListener('hashchange', openHash);
   filter();
   openHash();
 })();
 """
+
+
+def pacific_time(value: datetime) -> str:
+    try:
+        from zoneinfo import ZoneInfo
+        local = value.astimezone(ZoneInfo("America/Los_Angeles"))
+    except Exception:
+        local = value.astimezone(timezone(timedelta(hours=-8), "PST"))
+    return local.strftime("%Y-%m-%d %H:%M:%S ") + local.tzname()
 
 
 def snapshot_time(ledger: dict, *, terminal: bool) -> datetime:
@@ -860,9 +903,9 @@ def render(root: Path) -> str:
     previous = {identifier: status for identifier, status in previous.items()
                 if identifier in current_ids}
     notices.extend(previous_notices)
-    resolved_image_tag = expected_resolved_image_tag(manifest)
-    counts, changes, tile_inputs, detail_inputs = Counter(), Counter(), [], []
+    counts, changes, tile_inputs, detail_inputs, failure_items = Counter(), Counter(), [], [], []
     models = sorted({str(pair.get("model", "Unknown")) for pair in valid})
+    used_anchors: set[str] = set()
     for index, pairing in enumerate(sorted(valid, key=lambda p: (
         str(p.get("model", "")), str(p.get("context", "")), str(p.get("mode", "")),
     ))):
@@ -885,7 +928,7 @@ def render(root: Path) -> str:
         change = result_change(status, previous_status)
         if change:
             changes[change] += 1
-        anchor = f"config-{index + 1}"
+        anchor = pairing_anchor(identifier, index, used_anchors)
         failed = [str(check.get("name", "")) for check in phase_checks(report) if check.get("status") == "failed"]
         phase = next((str(check.get("name")) for check in phase_checks(report) if check.get("status") == "running"), "")
         failure = "; ".join(failed) or (reason if status in ("failed", "incomplete") else phase)
@@ -906,6 +949,8 @@ def render(root: Path) -> str:
             pairing, entry, tile_report, status, reason, report_error, anchor, directory,
             previous_status, change,
         ))
+        if status == "failed":
+            failure_items.append(failure_item(pairing, status, anchor, tile_report, reason))
     terminal = bool(valid) and counts["passed"] + counts["failed"] == len(valid) and len(entries) == len(valid) and all(
         isinstance(entry, dict) and entry.get("status") in ("passed", "failed")
         and not entry.get("reserved") for entry in entries.values()
@@ -922,8 +967,7 @@ def render(root: Path) -> str:
     ) in detail_inputs:
         details.append(config_details(root, pairing, entry, report, status, reason,
                                       report_error, anchor, directory, now,
-                                      manifest.get("image_tag"), previous_status, change,
-                                      resolved_image_tag=resolved_image_tag))
+                                      manifest.get("image_tag"), previous_status, change))
     peak, baseline, limit = (ledger.get(key) for key in ("peak_reserved_gpus", "baseline_gpus", "limit"))
     baseline = ledger.get("initial_baseline_gpus", baseline)
     if all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in (peak, limit)):
@@ -942,7 +986,6 @@ def render(root: Path) -> str:
         f'<span><strong>{counts[status]}</strong>{badge(status)}</span>' for status in STATUSES
     )
     budget_scope_html = ""
-    headroom = ledger.get("external_account_headroom")
     if budget_scope == "sweep":
         budget_scope_html = (
             '<details class="budget-audit"><summary>GPU accounting scope</summary>'
@@ -950,13 +993,6 @@ def render(root: Path) -> str:
             'sampling reservations, retained through restore and verified cleanup. '
             'Admissions also require available capacity in the requested hardware pool. '
             'Unrelated jobs are included only in the separate observed account peak.</p></details>'
-        )
-    elif isinstance(headroom, (int, float)) and not isinstance(headroom, bool) and headroom > 0:
-        budget_scope_html = (
-            '<details class="budget-audit"><summary>GPU accounting scope</summary>'
-            '<p class="notice">The peak covers recorded reservations. '
-            f'{esc(headroom)} GPUs from unrelated account jobs were charged after startup; '
-            'the historical account-wide peak is not verified.</p></details>'
         )
     elif ledger.get("account_usage_samples"):
         budget_scope_html = (
@@ -983,62 +1019,51 @@ def render(root: Path) -> str:
                 for label in ("Fixed", "Regressed", "Unchanged")
             ) + '</p></section>'
         )
-    audit_html = ""
-    audit_path = root / "image-audit.json"
-    if local_file(root, audit_path):
-        audit, audit_error = read_object(audit_path)
-        audit_html = (
-            '<details class="run-image-audit"><summary>Run image metadata proof</summary>'
-            f'<p>{artifact_link(root, audit_path, "Image audit JSON")}</p>'
-            f'<pre>{esc(audit_error) if audit_error else pretty(audit)}</pre></details>'
-        )
-    verification_html = ""
-    preflight_link = artifact_link(root, root / "preflight-notes.md", "Aborted runner preflights")
-    preflight_html = (
-        '<p class="muted preflight">Preflight evidence (no lifecycle operations; '
-        f'excluded from matrix): {preflight_link}</p>'
-        if preflight_link else ""
+    stamp = pacific_time(now)
+    live = bool(counts["queued"] or counts["running"])
+    refresh_note = (
+        "Auto-refreshes every 5 seconds while pairings are queued or running."
+        if live else "Auto-refresh is off; all pairings have finished."
     )
-    verification_path = root / "verification.json"
-    if local_file(root, verification_path):
-        verification, verification_error = read_object(verification_path)
-        verification_html = (
-            '<details><summary>Local verification</summary>'
-            f'<pre>{pretty(verification) if not verification_error else esc(verification_error)}</pre></details>'
+    failure_rail = ""
+    if failure_items:
+        failure_rail = (
+            '<aside class="failure-rail" aria-label="Failures">'
+            f'<h2>Failures <span>{len(failure_items)}</span></h2>'
+            f'<div class="failure-list">{"".join(failure_items)}</div></aside>'
         )
-    stamp = now.isoformat(timespec="seconds")
+    main_class = ' class="has-failures"' if failure_items else ""
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
         '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; '
         "script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\">"
-        f"<title>Lifecycle suites - {esc(root.name)}</title><style>{CSS}</style></head><body><main>"
+        f"<title>Lifecycle suites - {esc(root.name)}</title>"
+        + ('<meta http-equiv="refresh" content="5">' if live else '')
+        + f"<style>{CSS}</style></head>"
+        f"<body><main{main_class}>{failure_rail}<div class=\"report-body\">"
         '<div class="report-top"><header><div><h1>Lifecycle suites</h1>'
         f'<p>{len(valid)} configs &middot; {len(models)} models &middot; {esc(manifest.get("hardware", ""))}</p>'
-        f'</div><p class="muted">Snapshot {esc(stamp)}</p></header>'
+        f'</div><p class="muted">Snapshot {esc(stamp)}<br>{esc(refresh_note)}</p></header>'
         f'<section class="summary" aria-label="Suite counts">{summaries}</section>'
-        '<div class="view-controls">'
-        '<button id="capture-toggle" type="button" aria-pressed="false">Screenshot view</button>'
-        f'<span id="visible-count" aria-live="polite">{len(valid)} / {len(valid)} configs</span></div>'
+        f'<div class="view-controls"><span id="visible-count" aria-live="polite">{len(valid)} / {len(valid)} configs</span></div>'
         f'</div>{notice_html}'
         f'<p class="image-tag">Requested matrix image tag <strong>{esc(manifest.get("image_tag", "Not recorded"))}</strong></p>'
-        '<p class="resolved-image-tag">Expected resolved H200 tag '
-        f'<strong>{esc(resolved_image_tag if resolved_image_tag is not None else "Not recorded")}</strong></p>'
-        f'{preflight_html}'
-        f'{comparison_html}{audit_html}'
+        f'{comparison_html}'
         '<section class="metrics" aria-label="Test GPU metrics">'
         f'<span>Test GPU limit<strong>{esc(limit if limit is not None else "Not recorded")}</strong></span>'
         f'<span>Test GPU peak<strong>{esc(peak if peak is not None else "Not recorded")}</strong></span>'
         f'<span>Observed account GPU peak<strong>{esc(observed_peak if observed_peak is not None else "Not recorded")}</strong></span>'
         f'<span>Initial active GPUs<strong>{esc(baseline if baseline is not None else "Not recorded")}</strong></span>'
-        f'</section>{budget_scope_html}<div class="controls" id="results"><label>Search<input id="search" type="search"></label>'
+        f'</section>{budget_scope_html}'
+        '<div class="controls" id="results"><label>Search<input id="search" type="search"></label>'
         f'<label>Status<select id="status-filter"><option value="">All statuses</option>{status_options}</select></label>'
         f'<label>Model<select id="model-filter"><option value="">All models</option>{options}</select></label>'
         '</div>'
         f'<section class="config-grid" aria-label="Configuration results">{"".join(tiles)}</section>'
         '<p id="no-results" hidden>No matching configs.</p>'
-        f'<h2>Config details</h2>{"".join(details)}{verification_html}'
-        f"</main><script>{JS}</script></body></html>\n"
+        f'{"".join(details)}'
+        f"</div></main><script>{JS}</script></body></html>\n"
     )
 
 
