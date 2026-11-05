@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 import traceback
+import xml.etree.ElementTree as ET
 
 import requests
 
@@ -539,10 +540,27 @@ def collect_finished(active, root, state, client):
     return blocked
 
 
-def write_report(root, render):
+def write_summaries(root, state):
+    entries = state.get("entries") or {}
+    failed = [pair_id for pair_id, entry in entries.items() if entry.get("status") == "failed"]
+    (root / "failed-configs.txt").write_text("".join(f"{pair_id}\n" for pair_id in failed))
+    suite = ET.Element("testsuite", name="lifecycle-sweep", tests=str(len(entries)))
+    for pair_id, entry in entries.items():
+        case = ET.SubElement(suite, "testcase", classname="lifecycle", name=pair_id)
+        status = entry.get("status")
+        if status == "failed":
+            failure = ET.SubElement(case, "failure", message=str(entry.get("error") or "failed"))
+            failure.text = str(entry.get("error") or "")
+        elif status != "passed":
+            ET.SubElement(case, "skipped", message=str(status or "incomplete"))
+    ET.ElementTree(suite).write(root / "junit.xml", encoding="utf-8", xml_declaration=True)
+
+
+def write_report(root, render, state):
     temporary = root / "index.html.tmp"
     temporary.write_text(render(root), encoding="utf-8")
     temporary.replace(root / "index.html")
+    write_summaries(root, state)
 
 
 @contextmanager
@@ -743,7 +761,7 @@ def run_sweep(args, manifest, requests):
                     state["stop_reason"] = "insufficient_gpu_budget"
                 save(root / "ledger.json", state)
                 if time.monotonic() - last_report >= 30:
-                    write_report(root, render)
+                    write_report(root, render, state)
                     print(json.dumps({
                         "counts": dict(Counter(e["status"] for e in state["entries"].values())),
                         "reserved_gpus": used_gpus(state), "limit": state["limit"],
@@ -772,7 +790,7 @@ def run_sweep(args, manifest, requests):
             "error_at": state["error_at"],
         }), flush=True)
         try:
-            write_report(root, render)
+            write_report(root, render, state)
         except Exception as report_exc:
             state["report_error"] = f"{type(report_exc).__name__}: {report_exc}"
             save(root / "ledger.json", state)
@@ -801,7 +819,7 @@ def run_sweep(args, manifest, requests):
         state["finished_at" if state["complete"] else "stopped_at"] = now()
         save(root / "ledger.json", state)
         try:
-            write_report(root, render)
+            write_report(root, render, state)
         except Exception as exc:
             state["report_error"] = f"{type(exc).__name__}: {exc}"
             save(root / "ledger.json", state)
